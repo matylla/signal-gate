@@ -1,0 +1,45 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:  # This enables manual triggering
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Deploy to server
+      uses: appleboy/ssh-action@v0.1.5
+      with:
+        host: ${{ secrets.HOST }}
+        username: ${{ secrets.USERNAME }}
+        key: ${{ secrets.SSH_KEY }}
+        script: |
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          APP_DIR="/home/deploy/signal-gate"
+          REPO_URL="git@github.com:matylla/signal-gate.git"
+          SSH_KEY_PATH="~/.ssh/deploy_gate"
+
+          export GIT_SSH_COMMAND="ssh -i $SSH_KEY_PATH -o UserKnownHostsFile=~/.ssh/known_hosts"
+
+          # Check if directory exists and has git repo
+          if [ -d "$APP_DIR/.git" ]; then
+            echo "Repository exists, pulling latest changes..."
+            cd $APP_DIR
+            git pull origin master
+          else
+            echo "Repository doesn't exist, cloning..."
+            rm -rf $APP_DIR
+            git clone $REPO_URL $APP_DIR
+            cd $APP_DIR
+          fi
+
+          # Install dependencies
+          npm install --production
+
+          # Restart service
+          sudo systemctl restart signal-gate
