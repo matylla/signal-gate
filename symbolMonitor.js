@@ -351,8 +351,11 @@ class SymbolMonitor {
     }
 
     applyBookTickerUpdate(data) {
-        this.bestBid = parseFloat(data.b);
-        this.bestAsk = parseFloat(data.a);
+        const bid = Number.parseFloat(data.b);
+        const ask = Number.parseFloat(data.a);
+
+        if (Number.isFinite(bid) && bid > 0) this.bestBid = bid;
+        if (Number.isFinite(ask) && ask > 0) this.bestAsk = ask;
     }
 
     addAggTrade(tradeData) {
@@ -549,7 +552,6 @@ class SymbolMonitor {
         }
 
         if (this.ticker24hrVolumeUsdt < 750000) {
-            // console.log("ticker volume");
             return null;
         }
 
@@ -557,7 +559,9 @@ class SymbolMonitor {
             return null;
         }
 
-        if (this.bestBid === 0 || this.bestAsk === 0 || this.bestAsk <= this.bestBid) {
+        if (!Number.isFinite(this.bestBid) || !Number.isFinite(this.bestAsk) ||
+            this.bestBid <= 0 || this.bestAsk <= 0 ||
+            this.bestAsk <= this.bestBid) {
             return null;
         }
 
