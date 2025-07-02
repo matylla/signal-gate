@@ -669,7 +669,7 @@ class SymbolMonitor {
         console.log(new Date(), `[SIGNAL] ${this.symbol} | Px: ${this.lastPrice.toFixed(4)} | Vol30s: ${(this.volatility30s * 100).toFixed(1)}% | VolRatio: ${this.volatilityRatio.toFixed(2)} | TakerR: ${takerRatioInstant.toFixed(2)} | Spread: ${spreadBps.toFixed(1)}bps`);
 
         const vector = {
-            exchange: this.venue,  // NEW - which exchange
+            exchange: this.exchange,
             createdAt: new Date(now),
             symbol: this.symbol.replace(/[^A-Za-z0-9]/g, "").toUpperCase(),
             signalTimestampMs: now,
