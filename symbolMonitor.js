@@ -6,6 +6,10 @@ import CircularBuffer from "./circularBuffer.js";
 const priceQueue = new Queue("gate_price");
 const orderQueue = new Queue("gate_order");
 
+const EXPECTED_TRADE_SIZE_USD = 500;
+const MIN_EXECUTION_MULTIPLIER = 5;
+const MIN_24H_VOLUME_USD = 1_000_000;
+
 class SymbolMonitor {
     constructor(symbol, marketCapTier = "mid") {
         this.symbol = symbol;
@@ -546,6 +550,24 @@ class SymbolMonitor {
         return Math.max(tierFloor, quarterSecondShare);
     }
 
+    hasSufficientLiquidity() {
+        if (this.bidAskMidpoint <= 0) return false;
+
+        const notionalBid = this.depth5BidVolume * this.bidAskMidpoint;
+        const notionalAsk = this.depth5AskVolume * this.bidAskMidpoint;
+
+        // robust for unknown direction
+        const weakestSideDepth = Math.min(notionalBid, notionalAsk);
+        const minDepthNeeded   = EXPECTED_TRADE_SIZE_USD * MIN_EXECUTION_MULTIPLIER;
+        if (weakestSideDepth < minDepthNeeded) return false;
+
+        // make sure the market is actually trading, not just quoted
+        const min1sFlow = EXPECTED_TRADE_SIZE_USD;
+        if (this.current1sVolumeSum < min1sFlow) return false;
+
+        return true;
+    }
+
     async checkSignal() {
         const now = Date.now();
         this.updateTimeCache(now);
@@ -569,16 +591,11 @@ class SymbolMonitor {
             return null;
         }
 
-        // For 5-minute volatility, we can work with partial data
-        // but should have at least 60 returns (1 minute)
-        // const hasReliableVolatility = returnCount >= 60;
+        if (this.ticker24hrVolumeUsdt < MIN_24H_VOLUME_USD) {
+            return null;
+        }
 
-        // Log startup status periodically
-        // if (!hasReliableVolatility && now % 10000 < 250) {
-            // console.log(`[${this.symbol}] Warming up: ${returnCount} returns collected, need 60+ for signals`);
-        // }
-
-        if (this.ticker24hrVolumeUsdt < 1_000_000) { // $1M daily volume minimum
+        if (!this.hasSufficientLiquidity()) {
             return null;
         }
 
