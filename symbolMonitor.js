@@ -7,9 +7,9 @@ const priceQueue = new Queue("gate_price");
 const orderQueue = new Queue("gate_order");
 
 class SymbolMonitor {
-    constructor(symbol, venue, marketCapTier = "mid") {
+    constructor(symbol, marketCapTier = "mid") {
         this.symbol = symbol;
-        this.venue = venue;  // NEW - track which exchange
+        this.exchange = "gate";
         this.marketCapTier = marketCapTier;
 
         // Volume acceleration tracking
@@ -743,7 +743,6 @@ class SymbolMonitor {
             isWeekend: this.cachedIsWeekend,
 
             // DEPRECATED - for backwards compatibility only
-            atrFastPct: this.volatility30s / Math.sqrt(365 * 24 * 60 * 60), // Convert to "per-second" for compatibility
             realisedVolFast: this.volatility30s,
             realisedVolMedium: this.volatility5m,
             explosiveRatio: this.volatilityRatio,

@@ -57,8 +57,7 @@ new Worker("gate_order", async (job) => {
         signal_id: new ObjectId(id)
     }, {
         $set: {
-            symbol,
-            venue: "gate"
+            symbol
         },
         $push: {
             snapshots: {
