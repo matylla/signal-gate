@@ -1,5 +1,4 @@
 import axios from "axios";
-import params from "./parameters.js";
 
 const COINGECKO_API_URL = "https://api.coingecko.com/api/v3/coins/markets";
 const GATE_PAIRS_URL = "https://api.gateio.ws/api/v4/spot/currency_pairs";
@@ -11,9 +10,11 @@ const MIN_24H_VOLUME = 1_000_000;
 const MIN_MARKET_CAP = 50_000_000;
 
 function classifyTier(marketCap) {
-    if (marketCap >= params.TIER_LARGE_CAP_MIN_MARKET_CAP) return "large";
-    if (marketCap >= params.TIER_MID_CAP_MIN_MARKET_CAP)   return "mid";
-    return "small";
+    if (marketCap >= 50_000_000_000) return "mega";
+    if (marketCap >= 10_000_000_000) return "large";
+    if (marketCap >= 1_000_000_000) return "mid";
+    if (marketCap >= 100_000_000) return "small";
+    return "micro";
 }
 
 export default async function fetchBestPairs() {

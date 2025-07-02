@@ -7,77 +7,82 @@ const priceQueue = new Queue("gate_price");
 const orderQueue = new Queue("gate_order");
 
 class SymbolMonitor {
-    constructor(symbol, marketCapTier = "mid") {
+    constructor(symbol, venue, marketCapTier = "mid") {
         this.symbol = symbol;
+        this.venue = venue;  // NEW - track which exchange
+        this.marketCapTier = marketCapTier;
 
+        // Volume acceleration tracking
         this.accelHistory = new CircularBuffer(60);   // last 15 s (60×250 ms)
         this.accelSigma = 0;
 
+        // Price momentum tracking
         this.priceSlope = 0;
         this.priceSlopeHist = new CircularBuffer(40);  // ~10 s
         this.priceSlopeSigma = 0;
 
-        this.marketCapTier = marketCapTier;
-
+        // Time caching for efficiency
         this.cachedDayOfWeek = 0;
         this.cachedHourOfDay = 0;
         this.cachedIsWeekend = false;
         this.lastTimeCacheUpdate = 0;
 
+        // Trade and order book data
         this.aggTrades = new CircularBuffer(params.AGG_TRADE_BUFFER_SIZE);
         this.bestBid = 0;
         this.bestAsk = 0;
+        this.bidAskMidpoint = 0;
 
+        // Volume tracking
         this.current1sVolumeSum = 0;
         this.current1sTradeCount = 0;
-
         this.ewma1sVolumeFast = 0;
         this.ewma5mVolumeBaseline = 0;
         this.ewma1mVolumeBaseline = 0;
         this.prevEwma1s = 0;
         this.volumeAccel = 0;
 
+        // Taker flow tracking
         this.current1sTakerBuyVolume = 0;
         this.current1sTakerSellVolume = 0;
-
-        this.lastPrice = 0;
-        this.priceBuckets = new CircularBuffer(Math.ceil(params.PRICE_LOOKBACK_WINDOW_MS / params.PRICE_BUCKET_DURATION_MS) + 5);
-        this.lastPriceBucketTime = 0;
-
-        this.priceHistoryForATR = new CircularBuffer(params.ATR_PERIOD_SECONDS + 5);
-        this.lastAtrCalculationTime = 0;
-
-        this.rsiPriceHistory = new CircularBuffer(20);
-        this.rsiValue = 50;
-
         this.takerFlowImbalance = 0;
         this.takerFlowMagnitude = 0;
         this.takerFlowRatio = 0;
 
-        this.depth5ObImbalance = 0;
-        this.depth5BidVolume = 0;
-        this.depth5AskVolume = 0;
-        this.depth5TotalVolume = 0;
-        this.depth5VolumeRatio = 0;
+        // Price tracking
+        this.lastPrice = 0;
+        this.priceBuckets = new CircularBuffer(Math.ceil(params.PRICE_LOOKBACK_WINDOW_MS / params.PRICE_BUCKET_DURATION_MS) + 5);
+        this.lastPriceBucketTime = 0;
 
-        this.atrFast = 0;
-        this.atrSlow = 0;
+        // NEW: Volatility tracking using returns
+        this.returnHistory = new CircularBuffer(300); // 5 minutes of 1-second returns
+        this.lastReturnCalcTime = 0;
+        this.lastPriceForReturn = 0;
+        this.volatility30s = 0;  // 30-second realized volatility (annualized)
+        this.volatility5m = 0;   // 5-minute realized volatility (annualized)
+        this.volatilityRatio = 1.0;
 
-        this.ticker24hrVolumeUsdt = 0;
-        this.ticker24hrPriceChangePct = 0;
-        this.ticker24hrHigh = 0;
-        this.ticker24hrLow = 0;
+        // Microstructure quality tracking
+        this.effectiveSpreadHistory = new CircularBuffer(60); // 1 minute
+        this.avgEffectiveSpread = 0;
+        this.tradeImbalanceHistory = new CircularBuffer(60);
+        this.avgTradeImbalance = 0;
 
+        // Technical indicators
+        this.rsiPriceHistory = new CircularBuffer(20);
+        this.rsiValue = 50;
+        this.avgGain = 0;
+        this.avgLoss = 0;
+
+        // EMA tracking
         this.emaFast = 0;
         this.emaSlow = 0;
         this.ppoLine = 0;
         this.signalLine = 0;
         this.ppoHistogram = 0;
-
         this.ema9 = 0;
         this.ema21 = 0;
         this.ema50 = 0;
-
         this.emaAlignment9Over21 = false;
         this.emaAlignment21Over50 = false;
         this.emaStackedBullish = false;
@@ -87,9 +92,13 @@ class SymbolMonitor {
         this.ema21_50_spread = 0;
         this.emaAlignmentStrength = 0;
         this.priceAboveEma9 = false;
-        this.priceAboveEma21 = false;
-        this.priceAboveEma50 = false;
 
+        // Order book imbalance tracking
+        this.depth5ObImbalance = 0;
+        this.depth5BidVolume = 0;
+        this.depth5AskVolume = 0;
+        this.depth5TotalVolume = 0;
+        this.depth5VolumeRatio = 0;
         this.imbalanceHistory = new CircularBuffer(20);
         this.imbalanceMA5 = 0;
         this.imbalanceMA20 = 0;
@@ -97,8 +106,16 @@ class SymbolMonitor {
         this.imbalanceVelocity = 0;
         this.imbalanceVolatility = 0;
 
+        // Ticker data
+        this.ticker24hrVolumeUsdt = 0;
+        this.ticker24hrPriceChangePct = 0;
+        this.ticker24hrHigh = 0;
+        this.ticker24hrLow = 0;
+
+        // Signal control
         this.lastSignalTriggerTime = 0;
 
+        // Database references
         this.db = null;
         this.collection = null;
     }
@@ -106,7 +123,6 @@ class SymbolMonitor {
     updateTimeCache(now = Date.now()) {
         if (now - this.lastTimeCacheUpdate >= params.TIME_CACHE_DURATION_MS) {
             const date = new Date(now);
-
             this.cachedDayOfWeek = date.getUTCDay();
             this.cachedHourOfDay = date.getUTCHours();
             this.cachedIsWeekend = [0, 6].includes(date.getUTCDay());
@@ -114,82 +130,89 @@ class SymbolMonitor {
         }
     }
 
-    getATRVolatilityScaling() {
-        // Research formula: adjust threshold based on current vs historical ATR
-        if (this.atrSlow === 0 || this.atrFast === 0) {
-            return 1.0; // No scaling if ATR not ready
-        }
+    // NEW: Calculate volatility from returns
+    updateVolatility(currentPrice, now) {
+        // Only calculate returns at 1-second intervals
+        if (this.lastPriceForReturn > 0 && now - this.lastReturnCalcTime >= 1000) {
+            const logReturn = Math.log(currentPrice / this.lastPriceForReturn);
+            this.returnHistory.add({ time: now, return: logReturn });
 
-        const atrRatio = this.atrFast / this.atrSlow;
-        const atrSensitivity = 0.6; // Research suggests 0.6-0.8
+            // Get returns for different windows
+            const allReturns = this.returnHistory.toArray();
+            const cutoff30s = now - 30000;
+            const cutoff5m = now - 300000;
 
-        if (atrRatio > 1.5) {
-            // High volatility: increase threshold by up to 40%
-            return 1.0 + (atrSensitivity * (atrRatio - 1.5));
-        } else if (atrRatio < 0.8) {
-            // Low volatility: decrease threshold by up to 20%
-            return Math.max(0.8, 1.0 - (atrSensitivity * (0.8 - atrRatio) * 0.5));
-        } else {
-            // Medium volatility: minor adjustments around baseline
-            return 1.0 + (atrSensitivity * (atrRatio - 1.0) * 0.3);
+            const returns30s = allReturns.filter(r => r.time > cutoff30s).map(r => r.return);
+            const returns5m = allReturns.filter(r => r.time > cutoff5m).map(r => r.return);
+
+            // Calculate annualized volatilities
+            if (returns30s.length >= 10) { // Need at least 10 returns
+                this.volatility30s = this.calculateAnnualizedVolatility(returns30s);
+            }
+
+            if (returns5m.length >= 30) { // Need at least 30 returns for 5m
+                this.volatility5m = this.calculateAnnualizedVolatility(returns5m);
+                this.volatilityRatio = this.volatility5m > 0 ? this.volatility30s / this.volatility5m : 1.0;
+            }
+
+            this.lastPriceForReturn = currentPrice;
+            this.lastReturnCalcTime = now;
+        } else if (this.lastPriceForReturn === 0) {
+            // Initialize
+            this.lastPriceForReturn = currentPrice;
+            this.lastReturnCalcTime = now;
         }
     }
 
+    calculateAnnualizedVolatility(returns) {
+        if (returns.length < 2) return 0;
+
+        const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+        const variance = returns.reduce((sum, r) => sum + Math.pow(r - mean, 2), 0) / (returns.length - 1);
+        const stdDev = Math.sqrt(variance);
+
+        // Annualize: multiply by sqrt(seconds per year)
+        return stdDev * Math.sqrt(365 * 24 * 60 * 60);
+    }
+
+    // Updated dynamic threshold calculation
     getDynamicVolumeThreshold(timeContext = {}) {
-        const baseMultiplier = 4.0; // The baseline volume ratio we are looking for.
+        const baseMultiplier = 4.0;
 
-        if (this.lastPrice === 0 || this.atrSlow === 0) {
-            return baseMultiplier; // Not enough data, return baseline.
+        if (this.lastPrice === 0 || this.volatility5m === 0) {
+            return baseMultiplier;
         }
 
-        // --- 1. Unified Volatility Factor ---
-        // Start with the normalized absolute volatility.
-        // This asks: "How volatile is this asset right now, as a percentage?"
-        const normalizedAtr = this.atrFast / this.lastPrice;
+        // Use actual volatility instead of ATR
+        const normalizedVol = this.volatility30s / Math.sqrt(365 * 24 * 60 * 60); // Convert back to 1-second vol
 
-        // Now, determine the volatility regime based on the fast/slow ATR ratio.
-        // This asks: "Is the market heating up or cooling down?"
-        const atrRatio = this.atrFast / this.atrSlow;
+        // Volatility regime adjustment
         let regimeModifier;
-
-        // Research-backed regime definitions:
-        if (atrRatio > 1.5) {
-            // High Volatility Expansion: Be more aggressive with the adjustment.
-            regimeModifier = 1.25;
-        } else if (atrRatio < 0.8) {
-            // Volatility Contraction: Dampen the adjustment. The asset is quieting down.
-            regimeModifier = 0.75;
+        if (this.volatilityRatio > 1.5) {
+            regimeModifier = 1.25; // Volatility expansion
+        } else if (this.volatilityRatio < 0.8) {
+            regimeModifier = 0.75; // Volatility contraction
         } else {
-            // Normal/Trending Volatility: Use a baseline modifier.
-            regimeModifier = 1.0;
+            regimeModifier = 1.0;  // Normal regime
         }
 
-        // The unified factor: base volatility, scaled by the current regime.
-        // We add 1 so it's a multiplier starting from 1.0x.
-        // The 50 is a sensitivity constant; e.g., a 2% ATR (0.02) becomes 0.02 * 50 = 1.
-        const unifiedVolatilityFactor = 1 + (normalizedAtr * 50 * regimeModifier);
+        const volatilityFactor = 1 + (normalizedVol * 50 * regimeModifier);
 
-        // --- 2. Session Factor (using the corrected logic from below) ---
+        // Session factor
         const { hourOfDay = this.cachedHourOfDay, isWeekend = this.cachedIsWeekend } = timeContext;
-
         let sessionFactor = 1.0;
 
         if (isWeekend) {
-            // Weekends have their own distinct, often lower, volume profile.
-            sessionFactor = 0.8; // e.g., require less volume on weekends
+            sessionFactor = 0.8;
         } else {
-            // Weekday session logic
             if (hourOfDay >= 13 && hourOfDay <= 17) {
-                sessionFactor = 1.5; // EU-US peak overlap
+                sessionFactor = 1.5; // EU-US overlap
             } else if (hourOfDay >= 0 && hourOfDay < 7) {
-                sessionFactor = 0.75; // Asian low-liquidity period
+                sessionFactor = 0.75; // Asian session
             }
         }
 
-        // --- 3. Final Calculation ---
-        const dynamicThreshold = baseMultiplier * unifiedVolatilityFactor * sessionFactor;
-
-        // Apply sane caps to prevent extreme values.
+        const dynamicThreshold = baseMultiplier * volatilityFactor * sessionFactor;
         return Math.max(2.5, Math.min(20.0, dynamicThreshold));
     }
 
@@ -215,8 +238,6 @@ class SymbolMonitor {
         this.ema21_50_spread = (this.ema21 - this.ema50) / currentPrice;
         this.emaAlignmentStrength = this.ema9_21_spread + this.ema21_50_spread;
         this.priceAboveEma9 = currentPrice > this.ema9;
-        this.priceAboveEma21 = currentPrice > this.ema21;
-        this.priceAboveEma50 = currentPrice > this.ema50;
     }
 
     updateMACD(currentPrice) {
@@ -241,7 +262,7 @@ class SymbolMonitor {
         }
 
         if (this.signalLine === 0 && this.ppoLine !== 0) {
-             this.signalLine = this.ppoLine;
+            this.signalLine = this.ppoLine;
         }
 
         this.signalLine = (alphaSignal * this.ppoLine) + ((1 - alphaSignal) * this.signalLine);
@@ -250,12 +271,9 @@ class SymbolMonitor {
 
     updateRSI(currentPrice) {
         this.rsiPriceHistory.add(currentPrice);
-
         const period = 9;
 
-        if (this.rsiPriceHistory.size < 2) {
-            return;
-        }
+        if (this.rsiPriceHistory.size < 2) return;
 
         const prices = this.rsiPriceHistory.toArray();
         const priceChange = currentPrice - prices[prices.length - 2];
@@ -294,9 +312,7 @@ class SymbolMonitor {
     }
 
     updateDepthSnapshot(data) {
-        if (!data.bids?.length || !data.asks?.length) {
-            return;
-        }
+        if (!data.bids?.length || !data.asks?.length) return;
 
         let bidSum = 0;
         let askSum = 0;
@@ -322,7 +338,6 @@ class SymbolMonitor {
 
     updateImbalanceFeatures(currentImbalance) {
         this.imbalanceHistory.add(currentImbalance);
-
         this.imbalanceVelocity = currentImbalance - this.previousImbalance;
         this.previousImbalance = currentImbalance;
 
@@ -356,17 +371,36 @@ class SymbolMonitor {
 
         if (Number.isFinite(bid) && bid > 0) this.bestBid = bid;
         if (Number.isFinite(ask) && ask > 0) this.bestAsk = ask;
+
+        if (this.bestBid > 0 && this.bestAsk > 0) {
+            this.bidAskMidpoint = (this.bestBid + this.bestAsk) / 2;
+        }
     }
 
     addAggTrade(tradeData) {
-        this.aggTrades.add({
+        const trade = {
             price: parseFloat(tradeData.p),
             quantity: parseFloat(tradeData.q),
             eventTime: parseInt(tradeData.E, 10),
             isBuyerMaker: tradeData.m,
-        });
+        };
 
-        this.lastPrice = parseFloat(tradeData.p);
+        this.aggTrades.add(trade);
+        this.lastPrice = trade.price;
+
+        // Calculate effective spread if we have quotes
+        if (this.bidAskMidpoint > 0) {
+            const effectiveSpreadBps = Math.abs(trade.price - this.bidAskMidpoint) / this.bidAskMidpoint * 10000;
+            this.effectiveSpreadHistory.add(effectiveSpreadBps);
+
+            // Update average
+            const spreads = this.effectiveSpreadHistory.toArray();
+            this.avgEffectiveSpread = spreads.reduce((a, b) => a + b, 0) / spreads.length;
+        }
+
+        // Track trade imbalance
+        const imbalance = trade.isBuyerMaker ? -trade.quantity : trade.quantity;
+        this.tradeImbalanceHistory.add(imbalance);
     }
 
     applyTickerUpdate(tickerData) {
@@ -380,12 +414,10 @@ class SymbolMonitor {
     getHistoricalPrice(targetTimeMs) {
         for (let i = this.priceBuckets.size - 1; i >= 0; i--) {
             const bucket = this.priceBuckets.get(i);
-
             if (bucket && bucket.time <= targetTimeMs) {
                 return bucket.price;
             }
         }
-
         return null;
     }
 
@@ -393,6 +425,12 @@ class SymbolMonitor {
         const now = Date.now();
         const oneSecondAgo = now - 1000;
 
+        // Update volatility with current price
+        if (this.lastPrice > 0) {
+            this.updateVolatility(this.lastPrice, now);
+        }
+
+        // Calculate 1-second volume metrics
         let volume1s = 0;
         let tradeCount1s = 0;
         let takerBuyVolume1s = 0;
@@ -406,7 +444,6 @@ class SymbolMonitor {
 
             if (trade.eventTime >= oneSecondAgo) {
                 const tradeVolume = trade.price * trade.quantity;
-
                 volume1s += tradeVolume;
                 tradeCount1s++;
                 tradesInLastSecond.push(trade);
@@ -426,46 +463,19 @@ class SymbolMonitor {
         this.current1sTakerBuyVolume = takerBuyVolume1s;
         this.current1sTakerSellVolume = takerSellVolume1s;
 
+        // Update volume EMAs
         if (this.ewma5mVolumeBaseline === 0 && volume1s > 0) {
             this.ewma5mVolumeBaseline = volume1s;
         }
 
         this.ewma1sVolumeFast = (params.EWMA_ALPHA_VOL_FAST * volume1s) + ((1 - params.EWMA_ALPHA_VOL_FAST) * this.ewma1sVolumeFast);
         this.ewma5mVolumeBaseline = (params.EWMA_ALPHA_VOL_SLOW * volume1s) + ((1 - params.EWMA_ALPHA_VOL_SLOW) * this.ewma5mVolumeBaseline);
+        this.ewma1mVolumeBaseline = params.EWMA_ALPHA_VOL_MED * volume1s + (1 - params.EWMA_ALPHA_VOL_MED) * this.ewma1mVolumeBaseline;
 
-        this.ewma1mVolumeBaseline = params.EWMA_ALPHA_VOL_MED * volume1s +
-                            (1 - params.EWMA_ALPHA_VOL_MED) * this.ewma1mVolumeBaseline;
         this.volumeAccel = this.ewma1sVolumeFast - this.prevEwma1s;
-        this.prevEwma1s  = this.ewma1sVolumeFast;
+        this.prevEwma1s = this.ewma1sVolumeFast;
 
-        if (now - this.lastAtrCalculationTime >= 1000) {
-            if (tradesInLastSecond.length > 0) {
-                const prices = tradesInLastSecond.map(t => t.price);
-                const high = Math.max(...prices);
-                const low = Math.min(...prices);
-                const close = prices[0]; // Most recent trade in the 1s window
-                const prevClose = this.priceHistoryForATR.size > 0 ? this.priceHistoryForATR.getNewest().close : close;
-                const trueRange = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
-
-                // Initialize both ATRs if they are zero
-                if (this.atrFast === 0) this.atrFast = trueRange;
-                if (this.atrSlow === 0) this.atrSlow = trueRange;
-
-                // Update both fast and slow ATRs using their respective alphas
-                this.atrFast = (params.ATR_ALPHA * trueRange) + ((1 - params.ATR_ALPHA) * this.atrFast);
-                this.atrSlow = (params.ATR_ALPHA_SLOW * trueRange) + ((1 - params.ATR_ALPHA_SLOW) * this.atrSlow);
-
-                // This history buffer is for getting the previous close for the next TR calc
-                this.priceHistoryForATR.add({ high, low, close });
-            } else if (this.priceHistoryForATR.size > 0) {
-                // Carry forward last candle if no trades
-                const lastCandle = this.priceHistoryForATR.getNewest();
-                this.priceHistoryForATR.add(lastCandle);
-            }
-
-            this.lastAtrCalculationTime = now;
-        }
-
+        // Update price buckets
         if (this.lastPrice > 0) {
             const currentBucketFloor = Math.floor(now / params.PRICE_BUCKET_DURATION_MS) * params.PRICE_BUCKET_DURATION_MS;
 
@@ -478,7 +488,6 @@ class SymbolMonitor {
                 this.lastPriceBucketTime = currentBucketFloor;
             } else {
                 const lastEntry = this.priceBuckets.getNewest();
-
                 if (lastEntry && lastEntry.time === currentBucketFloor) {
                     lastEntry.price = this.lastPrice;
                 } else if (!lastEntry || lastEntry.time < currentBucketFloor) {
@@ -487,40 +496,38 @@ class SymbolMonitor {
             }
         }
 
+        // Update technical indicators
         this.updateEMAAlignment(this.lastPrice);
         this.updateRSI(this.lastPrice);
         this.updateMACD(this.lastPrice);
 
+        // Update taker flow metrics
         const buy = this.current1sTakerBuyVolume;
         const sell = this.current1sTakerSellVolume;
-
         this.takerFlowImbalance = (buy - sell) / (buy + sell + 1e-8);
         this.takerFlowMagnitude = buy + sell;
         this.takerFlowRatio = buy / (sell + 1e-8);
 
+        // Update acceleration history
         this.accelHistory.add(this.volumeAccel);
-
         if (this.accelHistory.size >= 20) {
             const a = this.accelHistory.toArray();
-            const mean = a.reduce((s,x)=>s+x,0) / a.length;
-            const var_ = a.reduce((s,x)=>s+(x-mean)**2,0) / a.length;
-            this.accelSigma = Math.sqrt(var_);
+            const mean = a.reduce((s, x) => s + x, 0) / a.length;
+            const variance = a.reduce((s, x) => s + (x - mean) ** 2, 0) / a.length;
+            this.accelSigma = Math.sqrt(variance);
         }
 
+        // Update price slope
         const priceAtLookback2s = this.getHistoricalPrice(now - 2000) ?? this.lastPrice;
-
         const priceDelta = this.lastPrice - priceAtLookback2s;
-
-        this.priceSlope = params.PRICE_SLOPE_ALPHA * priceDelta +
-                          (1 - params.PRICE_SLOPE_ALPHA) * this.priceSlope;
+        this.priceSlope = params.PRICE_SLOPE_ALPHA * priceDelta + (1 - params.PRICE_SLOPE_ALPHA) * this.priceSlope;
 
         this.priceSlopeHist.add(this.priceSlope);
-
         if (this.priceSlopeHist.size >= 20) {
             const v = this.priceSlopeHist.toArray();
-            const m = v.reduce((s,x)=>s+x,0)/v.length;
-            const var_ = v.reduce((s,x)=>s+(x-m)**2,0)/v.length;
-            this.priceSlopeSigma = Math.sqrt(var_);
+            const m = v.reduce((s, x) => s + x, 0) / v.length;
+            const variance = v.reduce((s, x) => s + (x - m) ** 2, 0) / v.length;
+            this.priceSlopeSigma = Math.sqrt(variance);
         }
     }
 
@@ -528,127 +535,190 @@ class SymbolMonitor {
         const secondsInDay = 24 * 60 * 60;
         const quarterSecondShare = this.ticker24hrVolumeUsdt / secondsInDay * 0.25;
 
-        const tierFloor = this.marketCapTier === "large" ? 600
-                         : this.marketCapTier === "mid"   ? 500
-                         : 400;
+        const tierFloor = {
+            'mega': 1000,
+            'large': 600,
+            'mid': 500,
+            'small': 400,
+            'micro': 300
+        }[this.marketCapTier] || 400;
 
         return Math.max(tierFloor, quarterSecondShare);
     }
 
     async checkSignal() {
         const now = Date.now();
-
         this.updateTimeCache(now);
 
-        const maxAtr = this.ticker24hrVolumeUsdt < 2e8 ? 0.10 : 0.05;
-
-        if (this.atrSlow === 0) {
+        // Basic data availability checks
+        if (this.lastPrice === 0 || this.ewma5mVolumeBaseline === 0) {
             return null;
         }
 
-        if (this.atrSlow / this.lastPrice > maxAtr) {
-            // console.log("atr slow");
+        // NEW: Ensure we have enough return history for reliable volatility
+        const returnCount = this.returnHistory.size;
+
+        if (returnCount < 30) {
+            // Need at least 30 seconds of returns for volatility30s
             return null;
         }
 
-        if (this.ticker24hrVolumeUsdt < 750000) {
+        // Check if we have volatility data
+        if (this.volatility30s === 0) {
+            // Still warming up volatility calculations
             return null;
         }
 
+        // For 5-minute volatility, we can work with partial data
+        // but should have at least 60 returns (1 minute)
+        // const hasReliableVolatility = returnCount >= 60;
+
+        // Log startup status periodically
+        // if (!hasReliableVolatility && now % 10000 < 250) {
+            // console.log(`[${this.symbol}] Warming up: ${returnCount} returns collected, need 60+ for signals`);
+        // }
+
+        if (this.ticker24hrVolumeUsdt < 1_000_000) { // $1M daily volume minimum
+            return null;
+        }
+
+        // Cooldown check
         if (now - this.lastSignalTriggerTime < params.SIGNAL_COOLDOWN_MS) {
             return null;
         }
 
+        // Volatility checks based on tier
+        const maxVolatility = {
+            'mega': 0.50,   // 50% annualized
+            'large': 0.80,  // 80% annualized
+            'mid': 1.20,    // 120% annualized
+            'small': 2.00,  // 200% annualized
+            'micro': 3.00   // 300% annualized
+        };
+
+        const tierMaxVol = maxVolatility[this.marketCapTier] || 1.50;
+        if (this.volatility5m > tierMaxVol) {
+            return null; // Too volatile
+        }
+
+        if (this.volatility5m < 0.05) {
+            return null; // Too stable (< 5% annual vol)
+        }
+
+        // Spread checks
         if (!Number.isFinite(this.bestBid) || !Number.isFinite(this.bestAsk) ||
-            this.bestBid <= 0 || this.bestAsk <= 0 ||
-            this.bestAsk <= this.bestBid) {
+            this.bestBid <= 0 || this.bestAsk <= 0 || this.bestAsk <= this.bestBid) {
             return null;
         }
 
         const spreadPct = (this.bestAsk - this.bestBid) / this.bestAsk;
+        const spreadBps = spreadPct * 10000;
 
         if (spreadPct > params.MAX_BID_ASK_SPREAD_PCT) {
             return null;
         }
 
-        if (this.lastPrice === 0 || this.ewma5mVolumeBaseline === 0) {
-            return null;
+        // Spread relative to volatility check
+        const instantVol = this.volatility30s / Math.sqrt(365 * 24 * 60 * 60); // Convert to per-second
+        const normalizedSpread = spreadPct / (instantVol + 0.0001);
+        if (normalizedSpread > 3.0) {
+            return null; // Spread too wide relative to volatility
         }
 
-        const ratioFast1m = this.ewma1mVolumeBaseline > 0
-            ? this.ewma1sVolumeFast / this.ewma1mVolumeBaseline : 0;
-
-        const ratio1m5m   = this.ewma5mVolumeBaseline > 0
-            ? this.ewma1mVolumeBaseline / this.ewma5mVolumeBaseline : 0;
-
+        // Volume spike detection
+        const ratioFast1m = this.ewma1mVolumeBaseline > 0 ? this.ewma1sVolumeFast / this.ewma1mVolumeBaseline : 0;
+        const ratio1m5m = this.ewma5mVolumeBaseline > 0 ? this.ewma1mVolumeBaseline / this.ewma5mVolumeBaseline : 0;
         const accelZ = this.accelSigma > 0 ? this.volumeAccel / this.accelSigma : 0;
-
         const dynThresh = this.getDynamicVolumeThreshold();
 
         const isVolumeSpike =
-              ratioFast1m >= dynThresh &&
-              ratio1m5m   >= params.MIN_VOLUME_SPIKE_RATIO_1M5M &&
-              accelZ      >= params.VOLUME_ACCEL_ZSCORE &&
-              this.current1sVolumeSum >= this.getAbsoluteVolumeFloor() &&
-              this.current1sTradeCount >= params.MIN_TRADES_IN_1S;
+            ratioFast1m >= dynThresh &&
+            ratio1m5m >= params.MIN_VOLUME_SPIKE_RATIO_1M5M &&
+            accelZ >= params.VOLUME_ACCEL_ZSCORE &&
+            this.current1sVolumeSum >= this.getAbsoluteVolumeFloor() &&
+            this.current1sTradeCount >= params.MIN_TRADES_IN_1S;
 
         if (!isVolumeSpike) {
             return null;
         }
 
+        // Price momentum check
         const priceAtLookback = this.getHistoricalPrice(now - params.PRICE_LOOKBACK_WINDOW_MS);
-
         if (priceAtLookback === null || this.lastPrice <= priceAtLookback) {
             return null;
         }
 
         const priceChangePct = (this.lastPrice - priceAtLookback) / priceAtLookback;
-        const atrFastAsPercentage = this.atrFast > 0 ? this.atrFast / this.lastPrice : 0;
         const slopeZ = this.priceSlopeSigma > 0 ? this.priceSlope / this.priceSlopeSigma : 0;
 
         if (slopeZ < params.PRICE_SLOPE_ZSCORE) {
             return null;
         }
 
+        // Price move relative to volatility
+        const priceZScore = instantVol > 0 ? (priceChangePct / instantVol) : 0;
+        if (priceZScore < 1.5) {
+            return null; // Price move not significant relative to volatility
+        }
+
+        // All checks passed - trigger signal
         this.lastSignalTriggerTime = now;
 
-        const takerRatioSmoothed = this.current1sTakerBuyVolume / (this.current1sTakerSellVolume + 1);
+        const takerRatioInstant = this.current1sTakerBuyVolume / (this.current1sTakerSellVolume + 1);
 
-        const volatilityExpansionRatio = this.atrSlow > 0
-            ? this.atrFast / this.atrSlow
-            : 1.0;
-
-        const atrScaling = this.getATRVolatilityScaling();
-
-        console.log(new Date(), `[SIGNAL] ${this.symbol} | Px: ${this.lastPrice.toFixed(4)} | ATR: ${atrScaling.toFixed(2)}x | TakerR(s): ${takerRatioSmoothed.toFixed(2)}x | VolExp: ${volatilityExpansionRatio.toFixed(2)}x`);
+        console.log(new Date(), `[SIGNAL] ${this.symbol} | Px: ${this.lastPrice.toFixed(4)} | Vol30s: ${(this.volatility30s * 100).toFixed(1)}% | VolRatio: ${this.volatilityRatio.toFixed(2)} | TakerR: ${takerRatioInstant.toFixed(2)} | Spread: ${spreadBps.toFixed(1)}bps`);
 
         const vector = {
-            createdAt: new Date(),
-            symbol: this.symbol,
+            exchange: this.venue,  // NEW - which exchange
+            createdAt: new Date(now),
+            symbol: this.symbol.replace(/[^A-Za-z0-9]/g, "").toUpperCase(),
             signalTimestampMs: now,
             triggerPrice: this.lastPrice,
+
+            // Price metrics
             priceChangePct: priceChangePct,
+            priceSlope: this.priceSlope,
+            slopeZ: slopeZ,
+            priceZScore: priceZScore,
+
+            // Volume metrics
             volumeRatioFast1m: ratioFast1m,
             volumeRatio1m5m: ratio1m5m,
             volumeAccelZ: accelZ,
-            takerRatioSmoothed: takerRatioSmoothed,
-            takerBuyVolumeAbs: this.current1sTakerBuyVolume,
-            volatilityExpansionRatio: volatilityExpansionRatio,
             current1sVolumeUsdt: this.current1sVolumeSum,
+            volumePerDollar: this.current1sVolumeSum / (this.ticker24hrVolumeUsdt + 1),
+            dynVolumeThresh: dynThresh,
+
+            // Volatility metrics (NEW)
+            volatility30s: this.volatility30s,
+            volatility5m: this.volatility5m,
+            volatilityRatio: this.volatilityRatio,
+
+            // Microstructure metrics
             spreadPct: spreadPct,
-            atrFastPct: atrFastAsPercentage,
+            spreadBps: spreadBps,
+            normalizedSpread: normalizedSpread,
+            effectiveSpreadBps: this.avgEffectiveSpread,
+
+            // Order book metrics
             depth5ObImbalance: this.depth5ObImbalance,
             depth5BidVolume: this.depth5BidVolume,
             depth5AskVolume: this.depth5AskVolume,
             depth5TotalVolume: this.depth5TotalVolume,
             depth5VolumeRatio: this.depth5VolumeRatio,
-            ticker24hrVolumeUsdt: this.ticker24hrVolumeUsdt,
-            ticker24hrPriceChangePct: this.ticker24hrPriceChangePct,
-            ticker24hrHigh: this.ticker24hrHigh,
-            ticker24hrLow: this.ticker24hrLow,
+            imbalanceMA5: this.imbalanceMA5,
+            imbalanceMA20: this.imbalanceMA20,
+            imbalanceVelocity: this.imbalanceVelocity,
+            imbalanceVolatility: this.imbalanceVolatility,
+
+            // Taker flow metrics
+            takerRatioSmoothed: takerRatioInstant,
+            takerBuyVolumeAbs: this.current1sTakerBuyVolume,
             takerFlowImbalance: this.takerFlowImbalance,
             takerFlowMagnitude: this.takerFlowMagnitude,
             takerFlowRatio: this.takerFlowRatio,
+
+            // Technical indicators
             ppoHistogram: this.ppoHistogram,
             ppoLine: this.ppoLine,
             signalLine: this.signalLine,
@@ -660,23 +730,30 @@ class SymbolMonitor {
             emaStackedBearish: this.emaStackedBearish,
             emaStackedNeutral: this.emaStackedNeutral,
             priceAboveEma9: this.priceAboveEma9,
-            imbalanceMA5: this.imbalanceMA5,
-            imbalanceMA20: this.imbalanceMA20,
-            imbalanceVelocity: this.imbalanceVelocity,
-            imbalanceVolatility: this.imbalanceVolatility,
-            priceSlope: this.priceSlope,
-            slopeZ: slopeZ,
-            realisedVolFast: this.atrFast,
-            realisedVolMedium: this.atrSlow,
-            dynVolumeThresh: dynThresh,
-            explosiveRatio: this.atrSlow > 0 ? this.atrFast/this.atrSlow : 1,
+
+            // Market data
+            ticker24hrVolumeUsdt: this.ticker24hrVolumeUsdt,
+            ticker24hrPriceChangePct: this.ticker24hrPriceChangePct,
+            ticker24hrHigh: this.ticker24hrHigh,
+            ticker24hrLow: this.ticker24hrLow,
+
+            // Time features
             hourOfDay: this.cachedHourOfDay,
             dayOfWeek: this.cachedDayOfWeek,
-            isWeekend: this.cachedIsWeekend
+            isWeekend: this.cachedIsWeekend,
+
+            // DEPRECATED - for backwards compatibility only
+            atrFastPct: this.volatility30s / Math.sqrt(365 * 24 * 60 * 60), // Convert to "per-second" for compatibility
+            realisedVolFast: this.volatility30s,
+            realisedVolMedium: this.volatility5m,
+            explosiveRatio: this.volatilityRatio,
+            volatilityExpansionRatio: this.volatilityRatio
         };
 
+        // Save to database
         const insert = await mongo.signals.insertOne(vector);
 
+        // Queue follow-up tasks
         await priceQueue.add("gate_price", {
             id: insert.insertedId.toString(),
             symbol: this.symbol,
@@ -684,9 +761,10 @@ class SymbolMonitor {
         }, {
             removeOnComplete: true,
             removeOnFail: true,
-            delay: 31 * 60 * 1000
+            delay: 31 * 60 * 1000 // 31 minutes
         });
 
+        // Queue orderbook snapshots
         await orderQueue.add("gate_orderbook", {
             id: insert.insertedId.toString(),
             symbol: this.symbol,
@@ -707,7 +785,7 @@ class SymbolMonitor {
             delay: 10000
         });
 
-        await orderQueue.add("gate_ongorderbook", {
+        await orderQueue.add("gate_orderbook", {
             id: insert.insertedId.toString(),
             symbol: this.symbol,
             tOffset: 30
@@ -716,6 +794,8 @@ class SymbolMonitor {
             removeOnFail: true,
             delay: 30000
         });
+
+        return vector;
     }
 }
 
