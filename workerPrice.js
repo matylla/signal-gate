@@ -84,7 +84,7 @@ async function processJob(job) {
     });
 
     await mongo.prices.insertOne({
-        signalId: new ObjectId(id),
+        signal_id: new ObjectId(id),
         symbol: symbol.replace(/[^A-Za-z0-9]/g, "").toUpperCase(),
         exchange: "gate",
         sigma30m: sigma30m,
